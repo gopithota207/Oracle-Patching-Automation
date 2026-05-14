@@ -1,0 +1,683 @@
+#!/bin/bash
+# =============================================================================
+#  Oracle Database Automated Patching Script
+#  Supports: Oracle 12c / 18c / 19c / 21c on Linux (OPatch / RU / PSU)
+#  Usage   : sudo ./oracle_patch_automation.sh [OPTIONS]
+#  Author  : DBA Automation
+# =============================================================================
+
+set -euo pipefail
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION  –  Edit these variables to match your environment
+# ─────────────────────────────────────────────────────────────────────────────
+ORACLE_BASE="${ORACLE_BASE:-/u01/app/oracle}"
+ORACLE_HOME="${ORACLE_HOME:-/u01/app/oracle/product/19.3.0/dbhome_1}"
+ORACLE_SID="${ORACLE_SID:-ORCL}"
+ORACLE_USER="${ORACLE_USER:-oracle}"
+
+# Where you drop the downloaded patch zip(s)
+PATCH_STAGE_DIR="${PATCH_STAGE_DIR:-/u01/patches/stage}"
+
+# Working directory (zip extracted here)
+PATCH_WORK_DIR="${PATCH_WORK_DIR:-/u01/patches/work}"
+
+# Log directory
+LOG_DIR="${LOG_DIR:-/u01/patches/logs}"
+
+# Mail recipient for report (leave blank to skip email)
+MAIL_TO="${MAIL_TO:-}"
+
+# Rollback on failure?  yes / no
+AUTO_ROLLBACK="${AUTO_ROLLBACK:-yes}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTERNAL GLOBALS  (do not change)
+# ─────────────────────────────────────────────────────────────────────────────
+SCRIPT_NAME="$(basename "$0")"
+START_TS="$(date '+%Y%m%d_%H%M%S')"
+LOG_FILE="${LOG_DIR}/patch_${ORACLE_SID}_${START_TS}.log"
+REPORT_FILE="${LOG_DIR}/patch_report_${ORACLE_SID}_${START_TS}.txt"
+OPATCH="${ORACLE_HOME}/OPatch/opatch"
+SQLPLUS="${ORACLE_HOME}/bin/sqlplus"
+LSNRCTL="${ORACLE_HOME}/bin/lsnrctl"
+PATCH_ID=""           # filled after zip discovery
+PATCH_DIR=""          # filled after extraction
+OPATCH_OLD_VER=""     # OPatch version before upgrade
+OPATCH_NEW_VER=""     # OPatch version after upgrade
+STEP_ERRORS=0
+PRE_PATCH_INV=""
+POST_PATCH_INV=""
+
+# Colour codes (suppressed in log file)
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGGING HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+mkdir -p "$LOG_DIR" "$PATCH_STAGE_DIR" "$PATCH_WORK_DIR"
+
+log()  { local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"; echo "$msg" | tee -a "$LOG_FILE"; }
+info() { echo -e "${CYAN}[INFO]${RESET}  $*"; log "[INFO]  $*"; }
+ok()   { echo -e "${GREEN}[OK]${RESET}    $*"; log "[OK]    $*"; }
+warn() { echo -e "${YELLOW}[WARN]${RESET}  $*"; log "[WARN]  $*"; }
+error(){ echo -e "${RED}[ERROR]${RESET} $*" >&2; log "[ERROR] $*"; (( STEP_ERRORS++ )); }
+die()  { error "$*"; send_report "FAILED"; exit 1; }
+sep()  { echo -e "${BOLD}$(printf '=%.0s' {1..72})${RESET}"; log "$(printf '=%.0s' {1..72})"; }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIGNAL TRAP  –  clean shutdown on Ctrl-C / kill
+# ─────────────────────────────────────────────────────────────────────────────
+cleanup() {
+    warn "Script interrupted – attempting safe DB restart…"
+    start_database || true
+    send_report "INTERRUPTED"
+    exit 130
+}
+trap cleanup INT TERM
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UTILITY: run a command as oracle OS user
+# ─────────────────────────────────────────────────────────────────────────────
+run_as_oracle() {
+    sudo -u "$ORACLE_USER" bash -c "
+        export ORACLE_BASE='$ORACLE_BASE'
+        export ORACLE_HOME='$ORACLE_HOME'
+        export ORACLE_SID='$ORACLE_SID'
+        export PATH=\$ORACLE_HOME/bin:\$PATH
+        $*
+    "
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UTILITY: send SQL*Plus command, return output
+# ─────────────────────────────────────────────────────────────────────────────
+sqlplus_exec() {
+    run_as_oracle "$SQLPLUS -s / as sysdba <<'SQLEOF'
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF VERIFY OFF ECHO OFF
+$1
+EXIT;
+SQLEOF"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 0 – PREFLIGHT
+# ─────────────────────────────────────────────────────────────────────────────
+preflight() {
+    sep
+    info "STEP 0 – Pre-flight Checks"
+    sep
+
+    # Must run as root
+    [[ $EUID -eq 0 ]] || die "Script must be run as root (sudo)."
+
+    # Oracle user exists
+    id "$ORACLE_USER" &>/dev/null || die "OS user '$ORACLE_USER' not found."
+
+    # Directories & binaries
+    [[ -d "$ORACLE_HOME" ]] || die "ORACLE_HOME not found: $ORACLE_HOME"
+    [[ -x "$SQLPLUS"     ]] || die "sqlplus not found: $SQLPLUS"
+    # NOTE: OPatch binary is validated AFTER Step 1 upgrades it
+
+    # Disk space – require at least 10 GB free in ORACLE_HOME filesystem
+    local free_kb
+    free_kb=$(df -k "$ORACLE_HOME" | awk 'NR==2{print $4}')
+    if (( free_kb < 10485760 )); then
+        warn "Less than 10 GB free on ORACLE_HOME filesystem (${free_kb} KB). Proceeding anyway."
+    else
+        ok "Disk space OK ($(( free_kb / 1048576 )) GB free)."
+    fi
+
+    # ulimits
+    local open_files
+    open_files=$(sudo -u "$ORACLE_USER" bash -c 'ulimit -n')
+    (( open_files >= 65536 )) || warn "ulimit -n is $open_files; recommended ≥ 65536."
+
+    ok "Pre-flight checks complete."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 – UPGRADE OPATCH FROM STAGE DIRECTORY
+# ─────────────────────────────────────────────────────────────────────────────
+upgrade_opatch() {
+    sep
+    info "STEP 1 – Upgrade OPatch from Stage Directory"
+    sep
+
+    # OPatch zip is always named p6880880_<ver>_<platform>.zip on MOS
+    local opatch_zip
+    opatch_zip=$(find "$PATCH_STAGE_DIR" -maxdepth 1 -name "p6880880_*.zip" \
+                 -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}')
+
+    if [[ -z "$opatch_zip" ]]; then
+        warn "No OPatch zip (p6880880_*.zip) found in $PATCH_STAGE_DIR – using existing OPatch."
+        [[ -x "$OPATCH" ]] || die "Existing OPatch binary not found at $OPATCH either. Cannot continue."
+        OPATCH_OLD_VER=$(run_as_oracle "$OPATCH version" 2>/dev/null \
+                         | grep -oP '\d+\.\d+\.\d+\.\d+\.\d+' | head -1 || echo "unknown")
+        OPATCH_NEW_VER="$OPATCH_OLD_VER"
+        info "Existing OPatch version: $OPATCH_OLD_VER"
+        return 0
+    fi
+
+    info "Found OPatch zip: $opatch_zip"
+
+    # Capture current version before replacement
+    if [[ -x "$OPATCH" ]]; then
+        OPATCH_OLD_VER=$(run_as_oracle "$OPATCH version" 2>/dev/null \
+                         | grep -oP '\d+\.\d+\.\d+\.\d+\.\d+' | head -1 || echo "unknown")
+        info "Current OPatch version  : $OPATCH_OLD_VER"
+    else
+        OPATCH_OLD_VER="none"
+        info "No existing OPatch binary found – fresh install."
+    fi
+
+    # Backup existing OPatch directory
+    local opatch_backup="${ORACLE_HOME}/OPatch_backup_${START_TS}"
+    if [[ -d "${ORACLE_HOME}/OPatch" ]]; then
+        info "Backing up existing OPatch → $opatch_backup"
+        cp -rp "${ORACLE_HOME}/OPatch" "$opatch_backup" \
+            || die "Failed to backup existing OPatch directory."
+        ok "OPatch backed up to $opatch_backup"
+    fi
+
+    # Extract new OPatch zip directly into ORACLE_HOME
+    # The zip contains an 'OPatch' folder at its root, so it replaces it cleanly
+    local opatch_work="${PATCH_WORK_DIR}/opatch_upgrade_${START_TS}"
+    mkdir -p "$opatch_work"
+
+    info "Extracting new OPatch zip → $opatch_work …"
+    run_as_oracle "unzip -q '$opatch_zip' -d '$opatch_work'" \
+        || die "Failed to unzip OPatch: $opatch_zip"
+
+    # Verify extracted OPatch directory exists
+    local new_opatch_dir="${opatch_work}/OPatch"
+    [[ -d "$new_opatch_dir" ]] || \
+        die "Expected 'OPatch' folder not found inside zip. Got: $(ls $opatch_work)"
+
+    # Replace ORACLE_HOME/OPatch
+    info "Replacing ${ORACLE_HOME}/OPatch …"
+    rm -rf "${ORACLE_HOME}/OPatch"
+    cp -rp "$new_opatch_dir" "${ORACLE_HOME}/OPatch" \
+        || die "Failed to copy new OPatch to $ORACLE_HOME"
+
+    # Fix ownership
+    chown -R "${ORACLE_USER}:$(id -gn $ORACLE_USER)" "${ORACLE_HOME}/OPatch"
+    chmod -R u+x "${ORACLE_HOME}/OPatch"
+
+    # Verify new version
+    [[ -x "$OPATCH" ]] || die "OPatch binary not executable after upgrade: $OPATCH"
+    OPATCH_NEW_VER=$(run_as_oracle "$OPATCH version" 2>/dev/null \
+                     | grep -oP '\d+\.\d+\.\d+\.\d+\.\d+' | head -1 || echo "unknown")
+
+    ok "OPatch upgraded:  $OPATCH_OLD_VER  →  $OPATCH_NEW_VER"
+
+    # Cleanup temp extraction
+    rm -rf "$opatch_work"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 – DISCOVER & UNZIP PATCH
+# ─────────────────────────────────────────────────────────────────────────────
+discover_and_unzip() {
+    sep
+    info "STEP 2 – Discover & Unzip Patch"
+    sep
+
+    # Find the most recently modified patch zip, excluding the OPatch zip (p6880880_*)
+    local zip_file
+    zip_file=$(find "$PATCH_STAGE_DIR" -maxdepth 1 -name "p*.zip" \
+               ! -name "p6880880_*.zip" \
+               -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}')
+
+    [[ -n "$zip_file" ]] || die "No patch zip (p*.zip, excluding OPatch) found in $PATCH_STAGE_DIR"
+
+    info "Found patch zip: $zip_file"
+
+    # Derive patch ID from filename  (p<PATCHID>_*.zip)
+    PATCH_ID=$(basename "$zip_file" | grep -oP '(?<=p)\d+' | head -1)
+    [[ -n "$PATCH_ID" ]] || PATCH_ID="UNKNOWN"
+    info "Patch ID: $PATCH_ID"
+
+    # Clean work dir and extract
+    rm -rf "${PATCH_WORK_DIR:?}/${PATCH_ID}"
+    mkdir -p "$PATCH_WORK_DIR"
+
+    info "Extracting $zip_file → $PATCH_WORK_DIR …"
+    run_as_oracle "unzip -q '$zip_file' -d '$PATCH_WORK_DIR'" \
+        || die "unzip failed for $zip_file"
+
+    # Locate the extracted patch subdirectory
+    PATCH_DIR=$(find "$PATCH_WORK_DIR" -maxdepth 2 -name "*.xml" -path "*/etc/config/*" \
+                -exec dirname {} \; | head -1 | xargs dirname 2>/dev/null || true)
+
+    # Fallback: first numeric subdirectory under work dir (exclude any opatch_upgrade dirs)
+    if [[ -z "$PATCH_DIR" ]]; then
+        PATCH_DIR=$(find "$PATCH_WORK_DIR" -maxdepth 1 -mindepth 1 -type d \
+                    ! -name "opatch_upgrade_*" | head -1)
+    fi
+
+    [[ -d "$PATCH_DIR" ]] || die "Could not locate extracted patch directory under $PATCH_WORK_DIR"
+    ok "Patch extracted to: $PATCH_DIR"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 – OPATCH VERSION CONFIRMATION
+# ─────────────────────────────────────────────────────────────────────────────
+check_opatch_version() {
+    sep
+    info "STEP 3 – OPatch Version Confirmation"
+    sep
+
+    local current_ver
+    current_ver=$(run_as_oracle "$OPATCH version" 2>/dev/null \
+                  | grep -oP '\d+\.\d+\.\d+\.\d+\.\d+' | head -1)
+
+    info "Active OPatch version : $current_ver"
+
+    # Confirm it matches what we just installed
+    if [[ "$current_ver" == "$OPATCH_NEW_VER" ]]; then
+        ok "OPatch version confirmed: $current_ver"
+    else
+        warn "Version mismatch — expected $OPATCH_NEW_VER, got $current_ver. Proceeding anyway."
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4 – CONFLICT / PREREQUISITE CHECK  (opatch prereq)
+# ─────────────────────────────────────────────────────────────────────────────
+run_prereq_checks() {
+    sep
+    info "STEP 4 – OPatch Prerequisite & Conflict Check"
+    sep
+
+    local prereq_log="${LOG_DIR}/prereq_${START_TS}.log"
+
+    info "Running: opatch prereq CheckConflictAgainstOHWithDetail …"
+    if run_as_oracle "cd '$PATCH_DIR' && \
+        $OPATCH prereq CheckConflictAgainstOHWithDetail \
+        -ph '$PATCH_DIR'" \
+        2>&1 | tee -a "$prereq_log" "$LOG_FILE"; then
+        ok "No patch conflicts found."
+    else
+        die "OPatch prerequisite check FAILED. Review $prereq_log"
+    fi
+
+    info "Running: opatch prereq CheckMinimumOPatchVersion …"
+    run_as_oracle "cd '$PATCH_DIR' && \
+        $OPATCH prereq CheckMinimumOPatchVersion \
+        -ph '$PATCH_DIR'" \
+        2>&1 | tee -a "$prereq_log" "$LOG_FILE" || \
+        warn "CheckMinimumOPatchVersion warning (non-fatal)."
+
+    info "Running: opatch prereq CheckSystemSpace …"
+    run_as_oracle "cd '$PATCH_DIR' && \
+        $OPATCH prereq CheckSystemSpace \
+        -ph '$PATCH_DIR'" \
+        2>&1 | tee -a "$prereq_log" "$LOG_FILE" || \
+        die "Insufficient disk space per OPatch CheckSystemSpace."
+
+    ok "All prerequisite checks passed."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 5 – PRE-PATCH DATABASE HEALTH CHECK
+# ─────────────────────────────────────────────────────────────────────────────
+precheck_database() {
+    sep
+    info "STEP 5 – Pre-Patch Database Health Check"
+    sep
+
+    # DB status
+    local db_status
+    db_status=$(sqlplus_exec "SELECT STATUS FROM V\$INSTANCE;" 2>/dev/null | tr -d '[:space:]') || true
+
+    if [[ "$db_status" == "OPEN" ]]; then
+        ok "Database status: OPEN"
+    else
+        warn "Database status: $db_status  (expected OPEN)"
+    fi
+
+    # Invalid objects
+    local inv_count
+    inv_count=$(sqlplus_exec \
+        "SELECT COUNT(*) FROM DBA_OBJECTS WHERE STATUS='INVALID';" \
+        2>/dev/null | tr -d '[:space:]') || inv_count="N/A"
+    info "Invalid objects before patch: $inv_count"
+    (( inv_count > 0 )) && warn "$inv_count invalid objects found – consider recompiling before patching."
+
+    # Active sessions
+    local sess_count
+    sess_count=$(sqlplus_exec \
+        "SELECT COUNT(*) FROM V\$SESSION WHERE TYPE='USER' AND STATUS='ACTIVE';" \
+        2>/dev/null | tr -d '[:space:]') || sess_count="N/A"
+    info "Active user sessions: $sess_count"
+
+    # Check for active RMAN backup
+    local rman_active
+    rman_active=$(sqlplus_exec \
+        "SELECT COUNT(*) FROM V\$RMAN_BACKUP_JOB_DETAILS
+         WHERE STATUS='RUNNING';" \
+        2>/dev/null | tr -d '[:space:]') || rman_active="0"
+    (( rman_active > 0 )) && warn "RMAN backup is currently running – consider waiting."
+
+    # Gather & save current inventory snapshot
+    PRE_PATCH_INV=$(run_as_oracle "$OPATCH lspatches" 2>/dev/null || echo "N/A")
+    log "Pre-patch inventory:\n$PRE_PATCH_INV"
+
+    ok "Pre-patch health check complete."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 6 – BACKUP OPATCH INVENTORY
+# ─────────────────────────────────────────────────────────────────────────────
+backup_inventory() {
+    sep
+    info "STEP 6 – Backup OPatch Inventory"
+    sep
+
+    local inv_backup="${LOG_DIR}/inventory_backup_${START_TS}"
+    mkdir -p "$inv_backup"
+
+    cp -rp "${ORACLE_HOME}/inventory" "$inv_backup/" 2>/dev/null || true
+    cp -rp "${ORACLE_BASE}/inventory"  "$inv_backup/" 2>/dev/null || true
+
+    run_as_oracle "$OPATCH lsinventory -detail" \
+        > "${inv_backup}/lsinventory_pre.txt" 2>&1 || true
+
+    ok "Inventory backed up to $inv_backup"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 7 – STOP DATABASE & LISTENER
+# ─────────────────────────────────────────────────────────────────────────────
+stop_database() {
+    sep
+    info "STEP 7 – Stopping Database & Listener"
+    sep
+
+    # Kill any remaining user sessions gracefully
+    info "Disconnecting active user sessions…"
+    sqlplus_exec "
+        BEGIN
+          FOR s IN (SELECT sid, serial# FROM v\$session
+                    WHERE type='USER' AND username IS NOT NULL) LOOP
+            BEGIN
+              EXECUTE IMMEDIATE
+                'ALTER SYSTEM KILL SESSION ''' || s.sid || ',' || s.serial# || ''' IMMEDIATE';
+            EXCEPTION WHEN OTHERS THEN NULL;
+            END;
+          END LOOP;
+        END;
+    /" 2>/dev/null || warn "Session kill step skipped (DB may already be down)."
+
+    sleep 3
+
+    # Shutdown immediate
+    info "Shutting down Oracle database $ORACLE_SID…"
+    sqlplus_exec "SHUTDOWN IMMEDIATE;" 2>/dev/null && ok "Database shut down." \
+        || warn "SHUTDOWN IMMEDIATE failed – trying ABORT…" && \
+           sqlplus_exec "SHUTDOWN ABORT;" 2>/dev/null || true
+
+    # Stop listener
+    info "Stopping Oracle Listener…"
+    run_as_oracle "$LSNRCTL stop" 2>/dev/null && ok "Listener stopped." \
+        || warn "Listener stop returned non-zero (may already be down)."
+
+    sleep 2
+    ok "Database and Listener are down."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 8 – APPLY PATCH
+# ─────────────────────────────────────────────────────────────────────────────
+apply_patch() {
+    sep
+    info "STEP 8 – Applying Patch $PATCH_ID"
+    sep
+
+    local apply_log="${LOG_DIR}/opatch_apply_${START_TS}.log"
+
+    info "Running opatch apply (this may take 10-30 minutes)…"
+    if run_as_oracle "cd '$PATCH_DIR' && \
+        $OPATCH apply -silent -oh '$ORACLE_HOME'" \
+        2>&1 | tee -a "$apply_log" "$LOG_FILE"; then
+        ok "opatch apply completed successfully."
+    else
+        error "opatch apply FAILED. Check $apply_log"
+        if [[ "$AUTO_ROLLBACK" == "yes" ]]; then
+            warn "AUTO_ROLLBACK=yes – rolling back patch…"
+            rollback_patch
+        fi
+        die "Patch application failed."
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 8b – ROLLBACK (called on failure if AUTO_ROLLBACK=yes)
+# ─────────────────────────────────────────────────────────────────────────────
+rollback_patch() {
+    warn "Rolling back patch $PATCH_ID from $ORACLE_HOME …"
+    local rb_log="${LOG_DIR}/opatch_rollback_${START_TS}.log"
+    run_as_oracle "cd '$PATCH_DIR' && \
+        $OPATCH rollback -id '$PATCH_ID' -silent -oh '$ORACLE_HOME'" \
+        2>&1 | tee -a "$rb_log" "$LOG_FILE" \
+        && warn "Rollback completed." \
+        || warn "Rollback also failed – manual intervention required. Log: $rb_log"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 9 – START DATABASE & LISTENER
+# ─────────────────────────────────────────────────────────────────────────────
+start_database() {
+    sep
+    info "STEP 9 – Starting Database & Listener"
+    sep
+
+    # Start listener first
+    info "Starting Oracle Listener…"
+    run_as_oracle "$LSNRCTL start" 2>/dev/null && ok "Listener started." \
+        || warn "Listener start returned non-zero."
+
+    # Startup DB
+    info "Starting Oracle database $ORACLE_SID…"
+    sqlplus_exec "STARTUP;" 2>/dev/null && ok "Database started." \
+        || die "Database startup FAILED – manual intervention required."
+
+    sleep 5
+    ok "Database and Listener are up."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 10 – POST-PATCH SQL STEPS  (datapatch / utlrp)
+# ─────────────────────────────────────────────────────────────────────────────
+run_postpatch_sql() {
+    sep
+    info "STEP 10 – Post-Patch SQL Steps (datapatch & utlrp)"
+    sep
+
+    local datapatch="${ORACLE_HOME}/OPatch/datapatch"
+
+    if [[ -x "$datapatch" ]]; then
+        info "Running datapatch -verbose …"
+        run_as_oracle "$datapatch -verbose" \
+            2>&1 | tee -a "$LOG_FILE" \
+            && ok "datapatch completed." \
+            || warn "datapatch returned non-zero – review log."
+    else
+        warn "datapatch not found (may not be required for this patch type)."
+    fi
+
+    info "Recompiling invalid objects (utlrp.sql) …"
+    sqlplus_exec "@?/rdbms/admin/utlrp.sql" 2>&1 | tee -a "$LOG_FILE" || true
+
+    # Count remaining invalids
+    local inv_after
+    inv_after=$(sqlplus_exec \
+        "SELECT COUNT(*) FROM DBA_OBJECTS WHERE STATUS='INVALID';" \
+        2>/dev/null | tr -d '[:space:]') || inv_after="N/A"
+    info "Invalid objects after utlrp: $inv_after"
+    (( inv_after > 0 )) && warn "$inv_after objects still invalid after utlrp." \
+        || ok "No invalid objects remaining."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 11 – POST-PATCH VALIDATION
+# ─────────────────────────────────────────────────────────────────────────────
+validate_patch() {
+    sep
+    info "STEP 11 – Post-Patch Validation"
+    sep
+
+    # Confirm patch is listed in inventory
+    POST_PATCH_INV=$(run_as_oracle "$OPATCH lspatches" 2>/dev/null || echo "N/A")
+    log "Post-patch inventory:\n$POST_PATCH_INV"
+
+    if echo "$POST_PATCH_INV" | grep -q "$PATCH_ID"; then
+        ok "Patch $PATCH_ID confirmed in OPatch inventory."
+    else
+        warn "Patch $PATCH_ID NOT found in inventory – verify manually."
+    fi
+
+    # opatch lsinventory full check
+    run_as_oracle "$OPATCH lsinventory -detail" \
+        > "${LOG_DIR}/lsinventory_post_${START_TS}.txt" 2>&1 || true
+
+    # DB component status
+    info "Database component status:"
+    sqlplus_exec "
+        SELECT COMP_NAME, VERSION, STATUS
+        FROM   DBA_REGISTRY
+        ORDER  BY COMP_NAME;
+    " 2>/dev/null | tee -a "$LOG_FILE" || true
+
+    # DB open mode
+    local open_mode
+    open_mode=$(sqlplus_exec \
+        "SELECT OPEN_MODE FROM V\$DATABASE;" \
+        2>/dev/null | tr -d '[:space:]') || open_mode="UNKNOWN"
+    info "Database OPEN_MODE: $open_mode"
+    [[ "$open_mode" == "READWRITE" ]] && ok "Database is OPEN READ WRITE." \
+        || warn "Unexpected OPEN_MODE: $open_mode"
+
+    ok "Post-patch validation complete."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REPORT GENERATION & EMAIL
+# ─────────────────────────────────────────────────────────────────────────────
+send_report() {
+    local status="$1"
+    local end_ts; end_ts=$(date '+%Y-%m-%d %H:%M:%S')
+
+    cat > "$REPORT_FILE" <<EOF
+=======================================================================
+ ORACLE PATCH AUTOMATION REPORT
+=======================================================================
+ Database SID   : $ORACLE_SID
+ Oracle Home    : $ORACLE_HOME
+ Patch ID       : $PATCH_ID
+ Patch Dir      : ${PATCH_DIR:-N/A}
+ OPatch Before  : ${OPATCH_OLD_VER:-N/A}
+ OPatch After   : ${OPATCH_NEW_VER:-N/A}
+ Status         : $status
+ Started        : $START_TS
+ Completed      : $end_ts
+ Log File       : $LOG_FILE
+ Step Errors    : $STEP_ERRORS
+=======================================================================
+ PRE-PATCH INVENTORY
+-----------------------------------------------------------------------
+${PRE_PATCH_INV:-N/A}
+
+=======================================================================
+ POST-PATCH INVENTORY
+-----------------------------------------------------------------------
+${POST_PATCH_INV:-N/A}
+
+=======================================================================
+ Review the full log for details: $LOG_FILE
+=======================================================================
+EOF
+
+    info "Report written to $REPORT_FILE"
+
+    if [[ -n "$MAIL_TO" ]] && command -v mail &>/dev/null; then
+        mail -s "Oracle Patch $PATCH_ID on $ORACLE_SID – $status" \
+            "$MAIL_TO" < "$REPORT_FILE" \
+            && info "Report emailed to $MAIL_TO" \
+            || warn "Email send failed."
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+main() {
+    sep
+    echo -e "${BOLD}  Oracle DB Automated Patch Script  |  SID: $ORACLE_SID  |  $START_TS${RESET}"
+    sep
+
+    preflight
+    upgrade_opatch
+    discover_and_unzip
+    check_opatch_version
+    run_prereq_checks
+    precheck_database
+    backup_inventory
+    stop_database
+    apply_patch
+    start_database
+    run_postpatch_sql
+    validate_patch
+
+    sep
+    if (( STEP_ERRORS == 0 )); then
+        ok "ALL STEPS COMPLETED SUCCESSFULLY"
+        send_report "SUCCESS"
+    else
+        warn "COMPLETED WITH $STEP_ERRORS WARNING(S) / ERROR(S)"
+        send_report "COMPLETED_WITH_WARNINGS"
+    fi
+    sep
+    info "Full log : $LOG_FILE"
+    info "Report   : $REPORT_FILE"
+    sep
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ARGUMENT HANDLING
+# ─────────────────────────────────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+Usage: sudo $SCRIPT_NAME [OPTIONS]
+
+OPTIONS
+  -b, --oracle-base   PATH   Override ORACLE_BASE  (default: $ORACLE_BASE)
+  -h, --oracle-home   PATH   Override ORACLE_HOME  (default: $ORACLE_HOME)
+  -s, --sid           SID    Override ORACLE_SID   (default: $ORACLE_SID)
+  -p, --patch-dir     PATH   Override PATCH_STAGE_DIR
+  -m, --mail          EMAIL  Send report to this address
+  --no-rollback              Disable auto-rollback on failure
+  --help                     Show this help
+
+EXAMPLE
+  sudo ORACLE_SID=PROD ./oracle_patch_automation.sh --mail dba@example.com
+EOF
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -b|--oracle-base)  ORACLE_BASE="$2";      shift 2 ;;
+        -h|--oracle-home)  ORACLE_HOME="$2";      shift 2 ;;
+        -s|--sid)          ORACLE_SID="$2";       shift 2 ;;
+        -p|--patch-dir)    PATCH_STAGE_DIR="$2";  shift 2 ;;
+        -m|--mail)         MAIL_TO="$2";          shift 2 ;;
+        --no-rollback)     AUTO_ROLLBACK="no";    shift   ;;
+        --help)            usage ;;
+        *)                 warn "Unknown option: $1"; shift ;;
+    esac
+done
+
+main
